@@ -1,3 +1,5 @@
+import os.path as osp
+
 import mmcv
 import torch
 
@@ -14,9 +16,6 @@ from pyquaternion import Quaternion as Q
 
 from ..core.bbox import LiDARInstance3DBoxes, get_box_type
 
-
-CAM_NAME = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
 
 OBJECT_CLASSES = {
     12: 'pedestrian',
@@ -69,14 +68,22 @@ class SimBEVDataset(Dataset):
         filter_empty_gt=True,
         with_velocity=True,
         use_valid_flag=False,
-        load_interval=10,
+        load_interval=1,
         max_num_sweeps=9,
         box_type_3d='LiDAR',
         det_eval_mode='iou'
     ):
         super().__init__()
-        self.dataset_root = dataset_root
-        self.ann_file = ann_file
+        self.dataset_root = osp.abspath(osp.expanduser(dataset_root))
+        if isinstance(ann_file, str) and not osp.isabs(ann_file):
+            ann_file_abs = osp.abspath(ann_file)
+            if osp.exists(ann_file_abs):
+                self.ann_file = ann_file_abs
+            else:
+                self.ann_file = osp.abspath(osp.join(self.dataset_root, ann_file))
+        else:
+            self.ann_file = ann_file
+        self.ann_root = osp.abspath(osp.join(osp.dirname(self.ann_file), '..'))
         self.object_classes = object_classes
         self.map_classes = map_classes
         self.modality = modality
@@ -125,6 +132,142 @@ class SimBEVDataset(Dataset):
             for transform in self.pipeline.transforms:
                 if hasattr(transform, 'set_epoch'):
                     transform.set_epoch(epoch)
+
+    def _resolve_path(self, path):
+        if not isinstance(path, str):
+            return path
+
+        normalized = path.replace('\\', '/')
+
+        def alias_variants(p):
+            variants = [p]
+            replacements = (
+                ('ground-truth/', 'ground_truth/'),
+                ('/ground-truth/', '/ground_truth/'),
+                ('ground_truth/', 'ground-truth/'),
+                ('/ground_truth/', '/ground-truth/'),
+                ('sweeps/', 'samples/'),
+                ('/sweeps/', '/samples/'),
+                ('samples/', 'sweeps/'),
+                ('/samples/', '/sweeps/'),
+            )
+            for src, dst in replacements:
+                if src in p:
+                    variants.append(p.replace(src, dst))
+            return variants
+
+        root_candidates = []
+        if isinstance(self.ann_root, str):
+            root_candidates.append(self.ann_root)
+        root_candidates.append(self.dataset_root)
+        root_candidates = list(dict.fromkeys(root_candidates))
+
+        candidates = [osp.abspath(path) if not osp.isabs(path) else path]
+
+        if osp.isabs(path):
+            rel = normalized.lstrip('/')
+            rel_candidates = alias_variants(rel)
+            for base_root in root_candidates:
+                for rel_candidate in rel_candidates:
+                    candidates.append(osp.abspath(osp.join(base_root, rel_candidate)))
+
+            for prefix in ('dataset/simbev/', 'data/simbev/', 'simbev/'):
+                for base_root in root_candidates:
+                    for rel_candidate in rel_candidates:
+                        if rel_candidate.startswith(prefix):
+                            candidates.append(osp.abspath(osp.join(base_root, rel_candidate[len(prefix):])))
+
+            for base_root in root_candidates:
+                for rel_candidate in rel_candidates:
+                    marker = '/simbev/'
+                    idx = rel_candidate.find(marker)
+                    if idx >= 0:
+                        tail = rel_candidate[idx + len(marker):]
+                        candidates.append(osp.abspath(osp.join(base_root, tail)))
+        else:
+            for path_candidate in alias_variants(path):
+                for base_root in root_candidates:
+                    candidates.append(osp.abspath(osp.join(base_root, path_candidate)))
+
+        tried = set()
+        for candidate in candidates:
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+            if osp.exists(candidate):
+                return candidate
+
+        if osp.isabs(path):
+            rel = normalized.lstrip('/')
+            for rel_candidate in alias_variants(rel):
+                for base_root in root_candidates:
+                    for prefix in ('dataset/simbev/', 'data/simbev/', 'simbev/'):
+                        if rel_candidate.startswith(prefix):
+                            return osp.abspath(osp.join(base_root, rel_candidate[len(prefix):]))
+                    marker = '/simbev/'
+                    idx = rel_candidate.find(marker)
+                    if idx >= 0:
+                        tail = rel_candidate[idx + len(marker):]
+                        return osp.abspath(osp.join(base_root, tail))
+            return osp.abspath(osp.join(root_candidates[0], alias_variants(rel)[-1]))
+
+        return osp.abspath(osp.join(root_candidates[0], alias_variants(path)[-1]))
+
+    def _resolve_info_paths(self, info):
+        info['GT_SEG'] = self._resolve_path(info['GT_SEG'])
+        info['GT_DET'] = self._resolve_path(info['GT_DET'])
+        info['LIDAR'] = self._resolve_path(info['LIDAR'])
+
+        for key in list(info.keys()):
+            if key.startswith('RGB-'):
+                info[key] = self._resolve_path(info[key])
+
+    def _get_metadata_camera_names(self):
+        camera_names = []
+        for key, value in self.metadata.items():
+            if not isinstance(value, dict):
+                continue
+            if not key.startswith('CAM_'):
+                continue
+            if 'sensor2lidar_rotation' in value and 'sensor2ego_rotation' in value:
+                camera_names.append(key)
+        return camera_names
+
+    def _get_info_camera_names(self, info):
+        return [key[len('RGB-'):] for key in info.keys() if key.startswith('RGB-')]
+
+    def _get_sample_camera_names(self, info):
+        info_camera_names = self._get_info_camera_names(info)
+        metadata_camera_names = self._get_metadata_camera_names()
+
+        if not info_camera_names:
+            return metadata_camera_names
+
+        if not metadata_camera_names:
+            return sorted(info_camera_names)
+
+        info_camera_set = set(info_camera_names)
+        return [name for name in metadata_camera_names if name in info_camera_set]
+
+    def _get_camera_intrinsics(self, camera_name):
+        intrinsics = None
+
+        intrinsics_by_name = self.metadata.get('camera_intrinsics_by_name')
+        if isinstance(intrinsics_by_name, dict):
+            intrinsics = intrinsics_by_name.get(camera_name)
+
+        if intrinsics is None:
+            intrinsics = self.metadata.get('camera_intrinsics')
+
+        if intrinsics is None:
+            return None
+
+        intrinsics = np.array(intrinsics, dtype=np.float32)
+        if intrinsics.shape != (3, 3):
+            raise ValueError(
+                f'Invalid camera intrinsics shape for {camera_name}: {intrinsics.shape}.'
+            )
+        return intrinsics
     
     @classmethod
     def get_classes(cls, classes=None):
@@ -193,6 +336,9 @@ class SimBEVDataset(Dataset):
 
         for key in annotations['data']:
             data_infos += annotations['data'][key]['scene_data']
+
+        for info in data_infos:
+            self._resolve_info_paths(info)
         
         self.full_infos = data_infos
         
@@ -349,20 +495,32 @@ class SimBEVDataset(Dataset):
                 data['sweeps_ego2global'].append(ego2global)
 
         if self.modality['use_camera']:
+            camera_names = self._get_sample_camera_names(info)
+
             data['image_paths'] = []
             data['camera_intrinsics'] = []
             data['camera2lidar'] = []
             data['lidar2camera'] = []
             data['lidar2image'] = []
             data['camera2ego'] = []
+            data['camera_names'] = []
 
-            for camera in CAM_NAME:
-                data['image_paths'].append(info['RGB-' + camera])
+            for camera in camera_names:
+                camera_key = 'RGB-' + camera
+                if camera_key not in info:
+                    continue
+                if camera not in self.metadata:
+                    continue
 
                 # Camera intrinsics.
                 camera_intrinsics = np.eye(4).astype(np.float32)
+                intrinsics_3x3 = self._get_camera_intrinsics(camera)
+                if intrinsics_3x3 is None:
+                    continue
+                data['image_paths'].append(info[camera_key])
+                data['camera_names'].append(camera)
 
-                camera_intrinsics[:3, :3] = self.metadata['camera_intrinsics']
+                camera_intrinsics[:3, :3] = intrinsics_3x3
                 
                 data['camera_intrinsics'].append(camera_intrinsics)
                 

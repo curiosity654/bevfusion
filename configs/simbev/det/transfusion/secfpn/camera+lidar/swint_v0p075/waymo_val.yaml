@@ -1,0 +1,17 @@
+dataset_root: data/simbev/setup/waymo_val/
+
+img_pad_to_max_shape: true
+img_pad_value: 0
+img_pad_align: center
+
+model:
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 256]
+    out_channels: 256
+
+data:
+  val:
+    ann_file: ${dataset_root + "infos/simbev_infos_val.json"}
+  test:
+    ann_file: ${dataset_root + "infos/simbev_infos_val.json"}

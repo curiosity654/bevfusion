@@ -1,5 +1,5 @@
 dataset_type: SimBEVDataset
-dataset_root: /dataset/simbev/
+dataset_root: data/simbev/original/
 
 num_sweeps: 9
 time_step: 0.05
@@ -8,6 +8,9 @@ trim_step: 1
 point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size: [0.1, 0.1, 0.2]
 image_size: [256, 704]
+img_pad_to_max_shape: false
+img_pad_value: 0
+img_pad_align: center
 
 augment2d:
   resize: [[0.38, 0.55], [0.48, 0.48]]
@@ -54,6 +57,9 @@ train_pipeline:
   -
     type: LoadMultiViewImageFromFiles
     to_float32: true
+    pad_to_max_shape: ${img_pad_to_max_shape}
+    pad_value: ${img_pad_value}
+    pad_align: ${img_pad_align}
   -
     type: LoadSimBEVPointsFromFile
     coord_type: LIDAR
@@ -141,6 +147,9 @@ test_pipeline:
   -
     type: LoadMultiViewImageFromFiles
     to_float32: true
+    pad_to_max_shape: ${img_pad_to_max_shape}
+    pad_value: ${img_pad_value}
+    pad_align: ${img_pad_align}
   -
     type: LoadSimBEVPointsFromFile
     coord_type: LIDAR

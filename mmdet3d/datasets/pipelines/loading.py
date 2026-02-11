@@ -7,7 +7,7 @@ import numpy as np
 import torch.nn.functional as F
 from nuscenes.map_expansion.map_api import NuScenesMap
 from nuscenes.map_expansion.map_api import locations as LOCATIONS
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 from mmdet3d.core.points import BasePoints, get_points_type
@@ -29,9 +29,19 @@ class LoadMultiViewImageFromFiles:
         color_type (str): Color type of the file. Defaults to 'unchanged'.
     """
 
-    def __init__(self, to_float32=False, color_type="unchanged"):
+    def __init__(
+        self,
+        to_float32=False,
+        color_type="unchanged",
+        pad_to_max_shape=False,
+        pad_value=0,
+        pad_align="center",
+    ):
         self.to_float32 = to_float32
         self.color_type = color_type
+        self.pad_to_max_shape = pad_to_max_shape
+        self.pad_value = pad_value
+        self.pad_align = pad_align
 
     def __call__(self, results):
         """Call function to load multi-view image from files.
@@ -55,17 +65,66 @@ class LoadMultiViewImageFromFiles:
         # img is of shape (h, w, c, num_views)
         # modified for waymo
         images = []
-        h, w = 0, 0
         for name in filename:
             images.append(Image.open(name))
-        
-        #TODO: consider image padding in waymo
+
+        original_shapes = [img.size for img in images]
+        pad_offsets = [(0, 0)] * len(images)
+
+        if self.pad_to_max_shape and len(images) > 0:
+            target_w = max(shape[0] for shape in original_shapes)
+            target_h = max(shape[1] for shape in original_shapes)
+
+            padded_images = []
+            computed_offsets = []
+            for img in images:
+                width, height = img.size
+                pad_w = max(target_w - width, 0)
+                pad_h = max(target_h - height, 0)
+
+                if self.pad_align == "center":
+                    left = pad_w // 2
+                    top = pad_h // 2
+                else:
+                    raise ValueError(f"Unsupported pad_align: {self.pad_align}")
+
+                right = pad_w - left
+                bottom = pad_h - top
+
+                padded_images.append(
+                    ImageOps.expand(
+                        img,
+                        border=(left, top, right, bottom),
+                        fill=self.pad_value,
+                    )
+                )
+                computed_offsets.append((top, left))
+
+            images = padded_images
+            pad_offsets = computed_offsets
+
+            if (
+                "camera_intrinsics" in results
+                and "lidar2camera" in results
+                and len(results["camera_intrinsics"]) == len(images)
+                and len(results["lidar2camera"]) == len(images)
+            ):
+                updated_lidar2image = []
+                for idx, (pad_top, pad_left) in enumerate(pad_offsets):
+                    camera_intrinsics = np.array(results["camera_intrinsics"][idx], copy=True)
+                    camera_intrinsics[0, 2] += pad_left
+                    camera_intrinsics[1, 2] += pad_top
+                    results["camera_intrinsics"][idx] = camera_intrinsics
+                    updated_lidar2image.append(camera_intrinsics @ results["lidar2camera"][idx])
+                results["lidar2image"] = updated_lidar2image
 
         results["filename"] = filename
         # unravel to list, see `DefaultFormatBundle` in formating.py
         # which will transpose each image separately and then stack into array
         results["img"] = images
-        # [1600, 900]
+        results["ori_shapes"] = original_shapes
+        results["img_pad_offsets"] = pad_offsets
+        # [width, height]
         results["img_shape"] = images[0].size
         results["ori_shape"] = images[0].size
         # Set initial values for default meta_keys
@@ -78,7 +137,10 @@ class LoadMultiViewImageFromFiles:
         """str: Return a string that describes the module."""
         repr_str = self.__class__.__name__
         repr_str += f"(to_float32={self.to_float32}, "
-        repr_str += f"color_type='{self.color_type}')"
+        repr_str += f"color_type='{self.color_type}', "
+        repr_str += f"pad_to_max_shape={self.pad_to_max_shape}, "
+        repr_str += f"pad_value={self.pad_value}, "
+        repr_str += f"pad_align='{self.pad_align}')"
         return repr_str
 
 
